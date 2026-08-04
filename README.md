@@ -6,5 +6,8 @@ git clone https://huggingface.co/Systran/faster-whisper-small
 чтобы загрузить все эти модели, необходимо перейти в папку "models" и в командной строке ввести все эти команды.    
 это были модели для транскрибации     
 git clone https://huggingface.co/pyannote/speaker-diarization-community-1    
-вот модель для диаризации
+вот модель для диаризации    
+
+
+для установки зависимостей в папке с проектом используйте pip install -r requirements.txt
 
