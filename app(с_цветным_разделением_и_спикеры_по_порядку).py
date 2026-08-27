@@ -330,7 +330,7 @@ def word_paragraph_xml(line: str) -> str:
         word_run_xml(f"{speaker_name}:", color=docx_color, bold=True),
     ]
     if content:
-        runs.append(word_run_xml(f" {content}", color=docx_color))
+        runs.append(word_run_xml(f" {content}"))
     return f"<w:p>{''.join(runs)}</w:p>"
 
 
