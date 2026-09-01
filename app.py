@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import importlib.util
 import io
 import os
 import re
@@ -21,6 +22,85 @@ os.environ["HF_HUB_DISABLE_UPDATE_CHECK"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["PYANNOTE_METRICS_ENABLED"] = "0"
+
+
+# В собранном PyInstaller-приложении CUDA/cuDNN DLL могут находиться в
+# _internal/torch/lib, рядом с ctranslate2 или в отдельной папке cuda_dlls.
+# Windows должен узнать об этих каталогах до импорта faster_whisper/torch.
+_DLL_DIRECTORY_HANDLES: list[object] = []
+
+
+def configure_windows_dll_search_paths() -> None:
+    if os.name != "nt":
+        return
+
+    if getattr(sys, "frozen", False):
+        runtime_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    else:
+        runtime_root = Path(__file__).resolve().parent
+
+    candidate_dirs = [
+        runtime_root,
+        runtime_root / "torch" / "lib",
+        runtime_root / "ctranslate2",
+        runtime_root / "cuda_dlls",
+        runtime_root / "nvidia" / "cublas" / "bin",
+        runtime_root / "nvidia" / "cublas" / "lib",
+        runtime_root / "nvidia" / "cudnn" / "bin",
+        runtime_root / "nvidia" / "cudnn" / "lib",
+        runtime_root / "nvidia" / "cuda_runtime" / "bin",
+        runtime_root / "nvidia" / "cuda_runtime" / "lib",
+    ]
+
+    # Этот блок также помогает при обычном запуске app.py из venv.
+    for package_name, relative_dir in (
+        ("torch", "lib"),
+        ("ctranslate2", ""),
+    ):
+        try:
+            package_spec = importlib.util.find_spec(package_name)
+        except (ImportError, ValueError):
+            package_spec = None
+        if package_spec is None:
+            continue
+
+        package_locations = package_spec.submodule_search_locations or ()
+        for location in package_locations:
+            candidate_dirs.append(Path(location) / relative_dir)
+
+    for environment_name in ("CUDA_PATH", "CUDNN_PATH"):
+        environment_path = os.environ.get(environment_name)
+        if environment_path:
+            candidate_dirs.append(Path(environment_path) / "bin")
+
+    unique_dirs: list[Path] = []
+    for directory in candidate_dirs:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved not in unique_dirs:
+            unique_dirs.append(resolved)
+
+    if unique_dirs:
+        current_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(
+            [str(directory) for directory in unique_dirs] + [current_path]
+        )
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is None:
+        return
+
+    for directory in unique_dirs:
+        try:
+            # Объекты-обработчики необходимо хранить до завершения программы.
+            _DLL_DIRECTORY_HANDLES.append(add_dll_directory(str(directory)))
+        except OSError:
+            continue
+
+
+configure_windows_dll_search_paths()
 
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -64,7 +144,7 @@ DIARIZATION_REQUIRED_FILES = (
     "plda/plda.npz",
     "plda/xvec_transform.npz",
 )
-RECORDING_SAMPLE_RATE = 16000
+MODEL_SAMPLE_RATE = 16000
 LOGO_RELATIVE_PATH = Path("assets") / "academy_logo.png"
 ICON_RELATIVE_PATH = Path("assets") / "app_icon.ico"
 
@@ -318,9 +398,10 @@ def word_run_xml(text: str, color: str | None = None, bold: bool = False) -> str
 
 
 def word_paragraph_xml(line: str) -> str:
+    paragraph_properties = '<w:pPr><w:jc w:val="both"/></w:pPr>'
     parts = split_speaker_line(line)
     if parts is None:
-        return f"<w:p>{word_run_xml(line)}</w:p>"
+        return f"<w:p>{paragraph_properties}{word_run_xml(line)}</w:p>"
 
     timestamp, speaker_name, content = parts
     docx_color, _marker = speaker_visual_style(speaker_name)
@@ -331,7 +412,7 @@ def word_paragraph_xml(line: str) -> str:
     ]
     if content:
         runs.append(word_run_xml(f" {content}"))
-    return f"<w:p>{''.join(runs)}</w:p>"
+    return f"<w:p>{paragraph_properties}{''.join(runs)}</w:p>"
 
 
 def write_docx(path: Path, text: str) -> None:
@@ -447,7 +528,7 @@ def prepare_torchaudio_compatibility() -> None:
         setattr(torchaudio, "set_audio_backend", lambda _backend: None)
 
 
-def create_diarization_pipeline(model_path: Path):
+def create_diarization_pipeline(model_path: Path, allow_cuda: bool = True):
     try:
         import torch
 
@@ -468,7 +549,14 @@ def create_diarization_pipeline(model_path: Path):
     if pipeline is None:
         raise RuntimeError("Не удалось открыть локальную модель диаризации.")
 
-    if torch.cuda.is_available():
+    cuda_available = False
+    if allow_cuda:
+        try:
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+
+    if cuda_available:
         try:
             pipeline.to(torch.device("cuda"))
             return pipeline, "GPU CUDA"
@@ -485,14 +573,14 @@ def decode_audio_for_diarization(audio_path: Path) -> dict[str, object]:
     except ImportError as exc:
         raise RuntimeError("Не удалось загрузить локальный аудиодекодер.") from exc
 
-    samples = decode_audio(str(audio_path), sampling_rate=RECORDING_SAMPLE_RATE)
+    samples = decode_audio(str(audio_path), sampling_rate=MODEL_SAMPLE_RATE)
     if samples.size == 0:
         raise RuntimeError("В аудиофайле не обнаружен звук.")
 
     waveform = torch.from_numpy(samples.copy()).unsqueeze(0)
     return {
         "waveform": waveform,
-        "sample_rate": RECORDING_SAMPLE_RATE,
+        "sample_rate": MODEL_SAMPLE_RATE,
         "uri": make_rttm_uri(audio_path.stem),
     }
 
@@ -692,20 +780,57 @@ def create_whisper_model(model_path: Path) -> tuple[WhisperModel, str]:
 
 
 class AudioRecorder:
-    def __init__(self, sample_rate: int = RECORDING_SAMPLE_RATE) -> None:
+    def __init__(self, sample_rate: int | None = None) -> None:
         self.sample_rate = sample_rate
         self.frames: list[bytes] = []
         self.stream: sd.InputStream | None = None
+        self.device_id: int | None = None
+        self.device_name = ""
 
     def start(self) -> None:
         self.frames = []
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="int16",
-            callback=self._callback,
-        )
-        self.stream.start()
+        try:
+            device_info = sd.query_devices(kind="input")
+        except Exception as exc:
+            raise RuntimeError(
+                "Микрофон по умолчанию не найден. Выберите устройство ввода "
+                f"в настройках Windows и перезапустите приложение. ({exc})"
+            ) from exc
+
+        self.device_id = int(device_info["index"])
+        self.device_name = str(device_info["name"])
+        max_input_channels = int(device_info["max_input_channels"])
+        if max_input_channels < 1:
+            raise RuntimeError(
+                f"Устройство «{self.device_name}» не поддерживает запись звука."
+            )
+
+        if self.sample_rate is None:
+            self.sample_rate = int(round(float(device_info["default_samplerate"])))
+
+        try:
+            sd.check_input_settings(
+                device=self.device_id,
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="int16",
+            )
+            self.stream = sd.InputStream(
+                device=self.device_id,
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="int16",
+                callback=self._callback,
+            )
+            self.stream.start()
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(
+                f"Не удалось открыть микрофон «{self.device_name}» "
+                f"с частотой {self.sample_rate} Гц. Проверьте устройство ввода "
+                "по умолчанию и разрешение Windows на доступ к микрофону. "
+                f"Техническая информация: {exc}"
+            ) from exc
 
     def _callback(self, indata, frames, time, status) -> None:
         del frames, time
@@ -713,16 +838,30 @@ class AudioRecorder:
             print(status, file=sys.stderr)
         self.frames.append(bytes(indata))
 
+    def close(self) -> None:
+        stream = self.stream
+        self.stream = None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
     def stop_to_wav(self) -> Path:
         if self.stream is None:
             raise RuntimeError("Запись не была запущена.")
 
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
+        self.close()
 
         if not self.frames:
             raise RuntimeError("Не удалось записать звук с микрофона.")
+        if self.sample_rate is None:
+            raise RuntimeError("Не удалось определить частоту записи микрофона.")
 
         handle = tempfile.NamedTemporaryFile(
             prefix="whisper_recording_",
@@ -776,14 +915,49 @@ class TranscriptionWorker(QObject):
             )
             self.progress.emit("Распознаю речь локальной моделью Whisper...")
             model, whisper_device = create_whisper_model(whisper_path)
-            segments = transcribe_audio(
-                model=model,
-                audio_path=self.audio_path,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                word_timestamps=self.use_diarization,
-            )
+            try:
+                segments = transcribe_audio(
+                    model=model,
+                    audio_path=self.audio_path,
+                    language=self.language,
+                    beam_size=5,
+                    vad_filter=True,
+                    word_timestamps=self.use_diarization,
+                )
+            except Exception as cuda_error:
+                if not whisper_device.startswith("GPU CUDA"):
+                    raise
+
+                # CTranslate2 часто загружает cuBLAS/cuDNN только при первой
+                # фактической операции. Поэтому одной успешной инициализации
+                # WhisperModel недостаточно, чтобы считать CUDA рабочей.
+                del model
+                gc.collect()
+                self.progress.emit(
+                    "CUDA для Whisper недоступна. Повторяю на процессоре..."
+                )
+
+                model = WhisperModel(
+                    str(whisper_path),
+                    device="cpu",
+                    compute_type="int8",
+                )
+                whisper_device = "CPU (int8, резерв после ошибки CUDA)"
+                try:
+                    segments = transcribe_audio(
+                        model=model,
+                        audio_path=self.audio_path,
+                        language=self.language,
+                        beam_size=5,
+                        vad_filter=True,
+                        word_timestamps=self.use_diarization,
+                    )
+                except Exception as cpu_error:
+                    raise RuntimeError(
+                        "Не удалось выполнить распознавание ни на CUDA, "
+                        f"ни на CPU. Ошибка CUDA: {cuda_error}. "
+                        f"Ошибка CPU: {cpu_error}"
+                    ) from cpu_error
             del model
             gc.collect()
 
@@ -799,11 +973,48 @@ class TranscriptionWorker(QObject):
                 pipeline, diarization_device = create_diarization_pipeline(
                     diarization_path
                 )
-                turns, rttm_text = diarize_audio(
-                    pipeline=pipeline,
-                    audio_path=self.audio_path,
-                    num_speakers=self.num_speakers,
-                )
+                try:
+                    turns, rttm_text = diarize_audio(
+                        pipeline=pipeline,
+                        audio_path=self.audio_path,
+                        num_speakers=self.num_speakers,
+                    )
+                except Exception as cuda_error:
+                    if diarization_device != "GPU CUDA":
+                        raise
+
+                    # Ошибка может появиться уже во время инференса, поэтому
+                    # создаём чистый CPU pipeline и повторяем операцию.
+                    del pipeline
+                    gc.collect()
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+                    self.progress.emit(
+                        "CUDA для диаризации недоступна. Повторяю на процессоре..."
+                    )
+                    pipeline, diarization_device = create_diarization_pipeline(
+                        diarization_path,
+                        allow_cuda=False,
+                    )
+                    diarization_device = "CPU (резерв после ошибки CUDA)"
+                    try:
+                        turns, rttm_text = diarize_audio(
+                            pipeline=pipeline,
+                            audio_path=self.audio_path,
+                            num_speakers=self.num_speakers,
+                        )
+                    except Exception as cpu_error:
+                        raise RuntimeError(
+                            "Не удалось выполнить диаризацию ни на CUDA, "
+                            f"ни на CPU. Ошибка CUDA: {cuda_error}. "
+                            f"Ошибка CPU: {cpu_error}"
+                        ) from cpu_error
                 del pipeline
                 gc.collect()
 
@@ -1547,6 +1758,8 @@ class MainWindow(QMainWindow):
             self.recorder = AudioRecorder()
             self.recorder.start()
         except Exception as exc:
+            if self.recorder is not None:
+                self.recorder.close()
             self.recorder = None
             QMessageBox.critical(self, "Ошибка записи", str(exc))
             return
@@ -1563,7 +1776,10 @@ class MainWindow(QMainWindow):
         self.open_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.file_button.setEnabled(False)
-        self.status_label.setText("Идет запись. Нажмите кнопку еще раз, чтобы остановить.")
+        self.status_label.setText(
+            f"Идет запись с микрофона «{self.recorder.device_name}» "
+            f"({self.recorder.sample_rate} Гц). Нажмите кнопку еще раз, чтобы остановить."
+        )
 
     def stop_recording_and_transcribe(self) -> None:
         if self.recorder is None:
