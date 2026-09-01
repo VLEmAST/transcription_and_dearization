@@ -1,18 +1,5 @@
-# GUI
+PyInstaller
 PyQt6
-
-# Local transcription and audio processing
-faster-whisper
-ctranslate2
-av
 sounddevice
-
-# Local speaker diarization
-torch
-torchaudio
+faster-whisper
 pyannote.audio
-
-
-
-# torchcodec is intentionally not required. The application decodes audio with
-# faster-whisper and passes an in-memory waveform dictionary to pyannote.audio.
